@@ -1,143 +1,190 @@
-import os
+import mysql.connector
+from mysql.connector import Error
 import pandas as pd
-import argparse
-import datetime
-from pathlib import Path  # Thư viện mới để xử lý đường dẫn file
+import os
+from datetime import datetime
 from vnstock import Finance, Vnstock, Listing, Quote
-from sqlalchemy import create_engine
 from dotenv import load_dotenv
 
+load_dotenv()
+db_user = os.getenv("DB_USER_CONTROLLER")
+db_pass = os.getenv("DB_PASS_CONTROLLER")
+db_host = os.getenv("DB_HOST_CONTROLLER")
+db_port = os.getenv("DB_PORT_CONTROLLER")
+db_name = os.getenv("DB_NAME_CONTROLLER")
 
-def connect_to_db():
-    """Tải cấu hình và kết nối tới database."""
-    load_dotenv()
-    db_user = os.getenv("MYSQLUSER")
-    db_pass = os.getenv("MYSQLPASSWORD")
-    db_host = os.getenv("MYSQLHOST")
-    db_port = os.getenv("MYSQLPORT")
-    db_name = os.getenv("MYSQLDATABASE")
+DB_CONFIG = {
+    'host': db_host,
+    'user': db_user,
+    'password': db_pass,
+    'database': db_name,
+    'port': db_port
+}
 
-    if not all([db_user, db_pass, db_host, db_port, db_name]):
-        print("Lỗi: Không tìm thấy biến môi trường database.")
-        return None
+RAW_DATA_PATH = "/raw-data"
+
+def fetch_data(target_date: str, symbol: str) -> dict or None:
+
+    print(f"\t[API] Gọi Vnstock cho mã {symbol} ngày: {target_date}...")
     try:
-        db_url = f"mysql+mysqlconnector://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
-        engine = create_engine(db_url)
-        print(f"Kết nối tới {db_host} thành công!")
-        return engine
-    except Exception as e:
-        print(f"Lỗi kết nối database: {e}")
-        return None
+        vnstock_instance = Vnstock()
 
+        company = vnstock_instance.stock(symbol=symbol, source='TCBS').company
+        data1 = company.overview()
 
-def fetch_data(target_date):
-    """Lấy dữ liệu từ vnstock cho MỘT NGÀY (target_date)."""
-    print(f"Bắt đầu lấy dữ liệu vnstock cho ngày: {target_date}...")
-    try:
-        company = Vnstock().stock(symbol='ACB', source='TCBS').company
-        finance = Finance(symbol='ACB', source='VCI')
+        finance = Finance(symbol=symbol, source='VCI')
+        data2 = finance.ratio(period='year', lang='vi', dropna=True).head()
+
         listing = Listing()
-        quote = Quote(symbol='ACB', source='VCI')
+        data3 = listing.symbols_by_exchange().head()
 
-        # Dùng target_date cho cả start và end để lấy dữ liệu 1 ngày
-        data_history = quote.history(start=target_date, end=target_date, interval='1D')
+        data4 = listing.symbols_by_industries().head()
+
+        quote = Quote(symbol=symbol, source='VCI')
+        data5 = quote.history(start=target_date, end=target_date, interval='1D')
 
         data_to_load = {
-            "company_overview": company.overview(),
-            "finance_ratio": finance.ratio(period='year', lang='vi', dropna=True),
-            "symbols_by_exchange": listing.symbols_by_exchange(),
-            "symbols_by_industries": listing.symbols_by_industries(),
-            "quote_history": data_history
+            "company_overview": data1,
+            "finance_ratio": data2,
+            "symbols_by_exchange": data3,
+            "symbols_by_industries": data4,
+            "quote_history": data5
         }
-        print("Lấy dữ liệu thành công.")
+
+        print("\t[API] Lấy dữ liệu thành công.")
         return data_to_load
+
     except Exception as e:
-        print(f"Lỗi khi lấy dữ liệu vnstock: {e}")
+        print(f"\t[LỖI API] Lỗi khi lấy dữ liệu Vnstock: {e}")
         return None
 
 
-def save_data_to_csv(data_dict):
-    """
-    Lưu các DataFrame thành file CSV với định dạng tên yêu cầu.
-    """
-    # Tạo thư mục output_data/ nếu nó chưa tồn tại
-    output_dir = Path("output_data")
-    output_dir.mkdir(exist_ok=True)
+def save_data_to_single_csv(data_dict: dict, file_path: str):
 
-    # Lấy ngày-giờ hiện tại để làm timestamp
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    df_list = list(data_dict.values())
+    if not df_list or all(df.empty for df in df_list if isinstance(df, pd.DataFrame)):
+        raise ValueError("Dữ liệu trả về rỗng hoặc không chứa DataFrame hợp lệ để lưu.")
 
-    print(f"Bắt đầu lưu file CSV vào thư mục {output_dir}...")
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
-    for table_name, df in data_dict.items():
-        if df is not None and not df.empty:
-            # Định dạng: [chuc_nang_file]_[ngay-gio].csv
-            file_name = f"{table_name}_{timestamp}.csv"
-            file_path = output_dir / file_name
+    with open(file_path, "w", encoding="utf-8-sig", newline='') as f:
+        for i, df in enumerate(df_list, start=1):
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                f.write(f"--- DATA {i} - {list(data_dict.keys())[i - 1].upper()} ---\n")
+                df.to_csv(f, index=False)
+                f.write("\n\n")
+            elif isinstance(df, pd.DataFrame) and df.empty:
+                f.write(f"--- DATA {i} - {list(data_dict.keys())[i - 1].upper()} ---\n")
+                f.write("No data returned for this segment.\n\n")
 
-            try:
-                df.to_csv(file_path, index=False, encoding='utf-8-sig')
-                print(f"-> Đã lưu: {file_path}")
-            except Exception as e:
-                print(f"Lỗi khi lưu file {file_name}: {e}")
-        else:
-            print(f"-> Bỏ qua {table_name} (không có dữ liệu)")
-
-
-def load_data_to_db(engine, data_dict):
-    """Tải (load) từng DataFrame lên database MySQL."""
-    print("Bắt đầu đẩy dữ liệu lên database...")
+def connect_db():
     try:
-        for table_name, df in data_dict.items():
-            if df is not None and not df.empty:
-                df.to_sql(
-                    table_name,
-                    con=engine,
-                    if_exists='replace',
-                    index=False,
-                    method='multi',
-                    chunksize=1000
-                )
-                print(f"-> Đẩy thành công bảng: {table_name}")
-            else:
-                print(f"-> Bỏ qua bảng {table_name} (không có dữ liệu).")
-        print("\n--- HOÀN TẤT ĐẨY DỮ LIỆU LÊN DB ---")
-    except Exception as e:
-        print(f"Lỗi khi đẩy dữ liệu lên SQL: {e}")
+        conn = mysql.connector.connect(**DB_CONFIG)
+        if conn.is_connected():
+            return conn
+    except Error as e:
+        print(f"❌ Lỗi khi kết nối tới DB Controller: {e}")
+        return None
 
 
-def main():
-    """
-    Hàm chính điều phối ETL, nhận 1 tham số --date.
-    """
-    parser = argparse.ArgumentParser(description="Chạy ETL cho dữ liệu vnstock.")
-
-    # Tính ngày mặc định (hôm nay)
-    today_str = datetime.date.today().isoformat()
-
-    # Thêm tham số --date, mặc định là ngày hôm nay
-    parser.add_argument(
-        '--date',
-        help="Ngày chạy ETL (định dạng YYYY-MM-DD)",
-        required=False,
-        default=today_str
-    )
-    args = parser.parse_args()
-
-    # --- Bắt đầu quy trình ---
-    engine = connect_to_db()
-    if not engine:
-        return  # Dừng nếu không kết nối được DB
-
-    data_dict = fetch_data(target_date=args.date)
-
-    if data_dict:
-        # Bước 1: Lưu file CSV (theo yêu cầu mới của bạn)
-        save_data_to_csv(data_dict)
-
-        # Bước 2: Tải dữ liệu lên Database
-        load_data_to_db(engine, data_dict)
+def get_configs_to_run(conn) -> list:
+    query = "SELECT id, data_date, ticker_symbol, directory_file, filename FROM Config WHERE flag = 1"
+    try:
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute(query)
+            return cursor.fetchall()
+    except Error as e:
+        print(f"❌ Lỗi khi lấy config: {e}")
+        return []
 
 
-if __name__ == "__main__":
-    main()
+def update_config_status(conn, config_id, status, is_processing, flag=None):
+    """Cập nhật trạng thái Config."""
+    query = "UPDATE Config SET status_config = %s, is_processing = %s, update_at = %s"
+    params = [status, is_processing, datetime.now()]
+    if flag is not None:
+        query += ", flag = %s"
+        params.append(flag)
+    query += " WHERE id = %s"
+    params.append(config_id)
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(query, tuple(params))
+        conn.commit()
+    except Error as e:
+        print(f"❌ Lỗi khi cập nhật config ID {config_id}: {e}")
+
+
+def log_event(conn, config_id, status, description):
+    """Insert vào bảng Log."""
+    query = "INSERT INTO Log (id_config, status, description, created_at) VALUES (%s, %s, %s, %s)"
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(query, (config_id, status, description, datetime.now()))
+        conn.commit()
+    except Error as e:
+        print(f"❌ Lỗi khi ghi log cho config ID {config_id}: {e}")
+
+def run_extract_process():
+    """Thực hiện luồng Extract dữ liệu cổ phiếu đã thống nhất."""
+    conn = connect_db()
+    if not conn:
+        print("Không thể kết nối DB, dừng chương trình.")
+        return
+
+    configs_to_run = get_configs_to_run(conn)
+    if not configs_to_run:
+        print("⏸️ Không tìm thấy config nào có flag=1. Kết thúc.")
+        conn.close()
+        return
+
+    print(f"🔥 Tìm thấy {len(configs_to_run)} công việc cần chạy.")
+
+    for config in configs_to_run:
+        config_id = config['id']
+
+        data_date = config.get('data_date', datetime.now().strftime('%Y-%m-%d'))
+        symbol = config.get('ticker_symbol', 'VCB')
+        raw_filename = config.get('filename', f"stock_{symbol}_{data_date.replace('-', '')}.csv")
+        raw_dir = config.get('directory_file', RAW_DATA_PATH)
+        file_path = os.path.join(raw_dir, raw_filename)
+
+        print(f"\n--- Bắt đầu xử lý Config ID: {config_id} ({symbol} - {data_date}) ---")
+
+        # --- A: Xóa Data Cũ ---
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                print(f"\t[Dọn dẹp] Đã xóa file cũ tại {file_path}")
+            except OSError as e:
+                print(f"\t[CẢNH BÁO] Không thể xóa file cũ: {e}")
+
+        update_config_status(conn, config_id, 'CRAWLING', 1)
+        log_event(conn, config_id, 'CRAWLING', f"Bắt đầu trích xuất cho {symbol} ngày {data_date}")
+
+        try:
+            data_to_load = fetch_data(data_date, symbol)
+
+            if data_to_load is None:
+                raise Exception("Lỗi API/Kết nối Vnstock hoặc không có dữ liệu trả về.")
+
+            save_data_to_single_csv(data_to_load, file_path)
+            print(f"✅ Đã lưu dữ liệu thành công vào {file_path}")
+
+            update_config_status(conn, config_id, 'CRAWLED', 0, flag=0)
+            log_event(conn, config_id, 'CRAWLED', f"Hoàn thành, file đã lưu tại {file_path}")
+
+        except Exception as e:
+            error_msg = f"Lỗi trong quá trình Extract: {e}"
+            print(f"🚨 {error_msg}")
+
+            update_config_status(conn, config_id, 'ERROR', 0, flag=1)
+            log_event(conn, config_id, 'ERROR', error_msg)
+
+    conn.close()
+    print("\n--- Hoàn tất quá trình Extract ---")
+
+
+if __name__ == '__main__':
+    run_extract_process()
