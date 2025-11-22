@@ -1,190 +1,275 @@
-import mysql.connector
-from mysql.connector import Error
 import pandas as pd
-import os
+import mysql.connector
 from datetime import datetime
-from vnstock import Finance, Vnstock, Listing, Quote
+import os
+import sys
+import argparse
 from dotenv import load_dotenv
+from vnstock import Finance, Vnstock, Listing, Quote
 
 load_dotenv()
-db_user = os.getenv("DB_USER_CONTROLLER")
-db_pass = os.getenv("DB_PASS_CONTROLLER")
-db_host = os.getenv("DB_HOST_CONTROLLER")
-db_port = os.getenv("DB_PORT_CONTROLLER")
-db_name = os.getenv("DB_NAME_CONTROLLER")
 
+# --- Cấu hình Database ---
 DB_CONFIG = {
-    'host': db_host,
-    'user': db_user,
-    'password': db_pass,
-    'database': db_name,
-    'port': db_port
+    "host": os.getenv("DB_HOST_CONTROLLER", "localhost"),
+    "port": os.getenv("DB_PORT_CONTROLLER", "3306"),
+    "user": os.getenv("DB_USER_CONTROLLER"),
+    "password": os.getenv("DB_PASS_CONTROLLER"),
+    "database": os.getenv("DB_NAME_CONTROLLER")
 }
 
-RAW_DATA_PATH = "/raw-data"
+# --- Cấu hình Đường dẫn (Sử dụng r"" để tránh lỗi đường dẫn Windows) ---
+# Lưu ý: Nếu không tìm thấy trong .env, nó sẽ dùng đường dẫn mặc định này
+DEFAULT_CSV_PATH = os.getenv(
+    "CSV_OUTPUT_PATH",
+    r"D:\Learn\Data Warehouse\DW_project\Data_Warehouse_Project\scripts\csv_output"
+)
+SYMBOL_FILE = os.getenv(
+    "SYMBOL_FILE_PATH",
+    r"D:\Learn\Data Warehouse\DW_project\Data_Warehouse_Project\scripts\symbol_company.txt"
+)
 
-def fetch_data(target_date: str, symbol: str) -> dict or None:
-
-    print(f"\t[API] Gọi Vnstock cho mã {symbol} ngày: {target_date}...")
-    try:
-        vnstock_instance = Vnstock()
-
-        company = vnstock_instance.stock(symbol=symbol, source='TCBS').company
-        data1 = company.overview()
-
-        finance = Finance(symbol=symbol, source='VCI')
-        data2 = finance.ratio(period='year', lang='vi', dropna=True).head()
-
-        listing = Listing()
-        data3 = listing.symbols_by_exchange().head()
-
-        data4 = listing.symbols_by_industries().head()
-
-        quote = Quote(symbol=symbol, source='VCI')
-        data5 = quote.history(start=target_date, end=target_date, interval='1D')
-
-        data_to_load = {
-            "company_overview": data1,
-            "finance_ratio": data2,
-            "symbols_by_exchange": data3,
-            "symbols_by_industries": data4,
-            "quote_history": data5
-        }
-
-        print("\t[API] Lấy dữ liệu thành công.")
-        return data_to_load
-
-    except Exception as e:
-        print(f"\t[LỖI API] Lỗi khi lấy dữ liệu Vnstock: {e}")
-        return None
+TODAY_DATE = datetime.now().strftime('%Y-%m-%d')
+DATE_FORMAT = '%Y-%m-%d'
 
 
-def save_data_to_single_csv(data_dict: dict, file_path: str):
+class CrawlJob:
+    def __init__(self, db_config, manual_start=None, manual_end=None):
+        self.db_config = db_config
+        self.manual_start = manual_start
+        self.manual_end = manual_end
 
-    df_list = list(data_dict.values())
-    if not df_list or all(df.empty for df in df_list if isinstance(df, pd.DataFrame)):
-        raise ValueError("Dữ liệu trả về rỗng hoặc không chứa DataFrame hợp lệ để lưu.")
+        self.conn = None
+        self.config_id = None
+        self.job_config = None
+        self.crawled_data_price = []
+        self.crawled_data_overview = []
+        self.crawled_data_ratio = []
+        self.data_listing_exchange = None
+        self.data_listing_industries = None
+        self.error_count = 0
+        self.success_count = 0
 
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    def _get_db_connection(self):
+        try:
+            if any(v is None for v in self.db_config.values()):
+                return None
+            if not self.conn or not self.conn.is_connected():
+                self.conn = mysql.connector.connect(**self.db_config)
+            return self.conn
+        except mysql.connector.Error:
+            return None
 
-    with open(file_path, "w", encoding="utf-8-sig", newline='') as f:
-        for i, df in enumerate(df_list, start=1):
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                f.write(f"--- DATA {i} - {list(data_dict.keys())[i - 1].upper()} ---\n")
-                df.to_csv(f, index=False)
-                f.write("\n\n")
-            elif isinstance(df, pd.DataFrame) and df.empty:
-                f.write(f"--- DATA {i} - {list(data_dict.keys())[i - 1].upper()} ---\n")
-                f.write("No data returned for this segment.\n\n")
+    def _close_db_connection(self):
+        if self.conn and self.conn.is_connected():
+            self.conn.close()
+            self.conn = None
 
-def connect_db():
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        if conn.is_connected():
-            return conn
-    except Error as e:
-        print(f"❌ Lỗi khi kết nối tới DB Controller: {e}")
-        return None
+    def _insert_logging(self, status: str, description: str):
+        if not self.config_id:
+            print(f"[LOGGING FAILED] Status: {status}, Desc: {description}", file=sys.stderr)
+            return
+        conn = self._get_db_connection()
+        if not conn: return
+        try:
+            cursor = conn.cursor()
+            query = "INSERT INTO logging (id_config, status, description) VALUES (%s, %s, %s)"
+            cursor.execute(query, (self.config_id, status, description))
+            conn.commit()
+            cursor.close()
+        except mysql.connector.Error as err:
+            print(f"Error inserting log: {err}")
+            conn.rollback()
 
+    def setup_config(self):
+        conn = self._get_db_connection()
+        if not conn: return False
+        cursor = conn.cursor(dictionary=True)
 
-def get_configs_to_run(conn) -> list:
-    query = "SELECT id, data_date, ticker_symbol, directory_file, filename FROM Config WHERE flag = 1"
-    try:
-        with conn.cursor(dictionary=True) as cursor:
-            cursor.execute(query)
-            return cursor.fetchall()
-    except Error as e:
-        print(f"❌ Lỗi khi lấy config: {e}")
-        return []
+        print("\n--- 1. Setting up Config ---")
+        try:
+            if self.manual_start and self.manual_end:
+                print(f"👉 RUNNING MANUAL MODE: {self.manual_start} to {self.manual_end}")
+                start_dt = datetime.strptime(self.manual_start, DATE_FORMAT)
+                end_dt = datetime.strptime(self.manual_end, DATE_FORMAT)
+            else:
+                print(f"👉 RUNNING DEFAULT MODE: Today ({TODAY_DATE})")
+                start_dt = datetime.strptime(TODAY_DATE, DATE_FORMAT)
+                end_dt = datetime.strptime(TODAY_DATE, DATE_FORMAT)
 
+            # Sửa lỗi cú pháp SQL: Xóa các dấu \ thừa
+            insert_query = """
+                INSERT INTO config (status, flag, is_processing, path, data_date_start, data_date_end)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(insert_query, ('READY', 1, False, DEFAULT_CSV_PATH, start_dt, end_dt))
+            self.config_id = cursor.lastrowid
+            conn.commit()
+            print(f"Job Setup Complete. Config ID: {self.config_id}")
+            return True
+        except mysql.connector.Error as err:
+            print(f"Config setup error: {err}")
+            conn.rollback()
+            return False
+        except ValueError as ve:
+            print(f"Date format error (Use YYYY-MM-DD): {ve}")
+            return False
+        finally:
+            cursor.close()
 
-def update_config_status(conn, config_id, status, is_processing, flag=None):
-    """Cập nhật trạng thái Config."""
-    query = "UPDATE Config SET status_config = %s, is_processing = %s, update_at = %s"
-    params = [status, is_processing, datetime.now()]
-    if flag is not None:
-        query += ", flag = %s"
-        params.append(flag)
-    query += " WHERE id = %s"
-    params.append(config_id)
-
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(query, tuple(params))
-        conn.commit()
-    except Error as e:
-        print(f"❌ Lỗi khi cập nhật config ID {config_id}: {e}")
-
-
-def log_event(conn, config_id, status, description):
-    """Insert vào bảng Log."""
-    query = "INSERT INTO Log (id_config, status, description, created_at) VALUES (%s, %s, %s, %s)"
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(query, (config_id, status, description, datetime.now()))
-        conn.commit()
-    except Error as e:
-        print(f"❌ Lỗi khi ghi log cho config ID {config_id}: {e}")
-
-def run_extract_process():
-    """Thực hiện luồng Extract dữ liệu cổ phiếu đã thống nhất."""
-    conn = connect_db()
-    if not conn:
-        print("Không thể kết nối DB, dừng chương trình.")
-        return
-
-    configs_to_run = get_configs_to_run(conn)
-    if not configs_to_run:
-        print("⏸️ Không tìm thấy config nào có flag=1. Kết thúc.")
-        conn.close()
-        return
-
-    print(f"🔥 Tìm thấy {len(configs_to_run)} công việc cần chạy.")
-
-    for config in configs_to_run:
-        config_id = config['id']
-
-        data_date = config.get('data_date', datetime.now().strftime('%Y-%m-%d'))
-        symbol = config.get('ticker_symbol', 'VCB')
-        raw_filename = config.get('filename', f"stock_{symbol}_{data_date.replace('-', '')}.csv")
-        raw_dir = config.get('directory_file', RAW_DATA_PATH)
-        file_path = os.path.join(raw_dir, raw_filename)
-
-        print(f"\n--- Bắt đầu xử lý Config ID: {config_id} ({symbol} - {data_date}) ---")
-
-        # --- A: Xóa Data Cũ ---
-        if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-                print(f"\t[Dọn dẹp] Đã xóa file cũ tại {file_path}")
-            except OSError as e:
-                print(f"\t[CẢNH BÁO] Không thể xóa file cũ: {e}")
-
-        update_config_status(conn, config_id, 'CRAWLING', 1)
-        log_event(conn, config_id, 'CRAWLING', f"Bắt đầu trích xuất cho {symbol} ngày {data_date}")
+    def start_processing(self):
+        if not self.config_id: return False
+        conn = self._get_db_connection()
+        if not conn: return False
 
         try:
-            data_to_load = fetch_data(data_date, symbol)
+            cursor = conn.cursor(dictionary=True)
+            conn.start_transaction()
 
-            if data_to_load is None:
-                raise Exception("Lỗi API/Kết nối Vnstock hoặc không có dữ liệu trả về.")
+            # Sửa lỗi cú pháp SQL: Xóa các dấu \ thừa
+            update_query = """
+                UPDATE config
+                SET status = 'CRAWLING', is_processing = TRUE
+                WHERE id = %s AND status = 'READY' AND is_processing = FALSE
+            """
+            cursor.execute(update_query, (self.config_id,))
 
-            save_data_to_single_csv(data_to_load, file_path)
-            print(f"✅ Đã lưu dữ liệu thành công vào {file_path}")
+            if cursor.rowcount == 0:
+                conn.rollback()
+                return False
 
-            update_config_status(conn, config_id, 'CRAWLED', 0, flag=0)
-            log_event(conn, config_id, 'CRAWLED', f"Hoàn thành, file đã lưu tại {file_path}")
+            conn.commit()
+            cursor.execute("SELECT * FROM config WHERE id = %s", (self.config_id,))
+            self.job_config = cursor.fetchone()
+            return True
+
+        except mysql.connector.Error:
+            conn.rollback()
+            return False
+        finally:
+            if 'cursor' in locals() and cursor: cursor.close()
+
+    def execute_crawl(self):
+        if not self.job_config: return
+        self._insert_logging('CRAWLING', 'Start crawling 5 data types.')
+
+        start_date_str = self.job_config['data_date_start'].strftime(DATE_FORMAT)
+        end_date_str = self.job_config['data_date_end'].strftime(DATE_FORMAT)
+
+        try:
+            # Sử dụng đường dẫn file symbol từ cấu hình
+            with open(SYMBOL_FILE, 'r', encoding='utf-8') as f:
+                symbols = [line.strip() for line in f if line.strip()]
+        except FileNotFoundError:
+            symbols = []
+            self._insert_logging('ERR', f"File {SYMBOL_FILE} not found.")
+
+        try:
+            listing = Listing()
+            self.data_listing_exchange = listing.symbols_by_exchange()
+            self.data_listing_industries = listing.symbols_by_industries()
+            self.success_count += 2
+        except Exception as e:
+            self._insert_logging('WARN', f"Listing data error (skipped): {e}")
+
+        for symbol in symbols:
+            try:
+                company_api = Vnstock().stock(symbol=symbol, source='TCBS').company
+                finance_api = Finance(symbol=symbol, source='VCI')
+                quote_api = Quote(symbol=symbol, source='VCI')
+
+                df_overview = company_api.overview()
+                df_overview['symbol'] = symbol
+                self.crawled_data_overview.append(df_overview)
+
+                df_ratio = finance_api.ratio(period='year', lang='vi', dropna=True)
+                df_ratio['symbol'] = symbol
+                self.crawled_data_ratio.append(df_ratio)
+
+                df_history = quote_api.history(start=start_date_str, end=end_date_str, interval='1D')
+                df_history['symbol'] = symbol
+                self.crawled_data_price.append(df_history)
+
+                self.success_count += 3
+            except Exception as e:
+                self.error_count += 1
+                self._insert_logging('ERR', f"Error for {symbol}: {e}")
+
+    def finalize_job(self):
+        if not self.config_id: return
+        conn = self._get_db_connection()
+        if not conn: return
+
+        final_status = 'ERR'
+        final_flag = 0
+
+        try:
+            cursor = conn.cursor()
+            # Sử dụng path từ DB config hoặc fallback về DEFAULT
+            path = self.job_config['path'] if self.job_config else DEFAULT_CSV_PATH
+            os.makedirs(path, exist_ok=True)
+
+            date_tag = self.job_config['data_date_end'].strftime(DATE_FORMAT)
+            total_rows_saved = 0
+
+            def save_to_csv(data, name_prefix, is_df=False):
+                nonlocal total_rows_saved
+                if is_df and data is not None:
+                    df = data
+                elif data and isinstance(data, list):
+                    df = pd.concat(data, ignore_index=True)
+                else:
+                    return 0
+
+                filename = f"{name_prefix}_{date_tag}.csv"
+                full_path = os.path.join(path, filename)
+                df.to_csv(full_path, index=False)
+                print(f"Saved {name_prefix}: {len(df)} rows")
+                total_rows_saved += len(df)
+                return len(df)
+
+            save_to_csv(self.crawled_data_price, "price_history")
+            save_to_csv(self.crawled_data_overview, "company_overview")
+            save_to_csv(self.crawled_data_ratio, "finance_ratio")
+            save_to_csv(self.data_listing_exchange, "listing_exchange", is_df=True)
+            save_to_csv(self.data_listing_industries, "listing_industries", is_df=True)
+
+            if total_rows_saved > 0:
+                final_status = 'CRAWLED'
+                final_flag = 1
+                self._insert_logging('SUCCESS', f"Finished. Saved {total_rows_saved} rows.")
+            else:
+                self._insert_logging('FAIL', "No data saved.")
+
+            update_query = "UPDATE config SET status = %s, is_processing = FALSE, flag = %s WHERE id = %s"
+            cursor.execute(update_query, (final_status, final_flag, self.config_id))
+            conn.commit()
+            print(f"Job Finalized. Status: {final_status}")
+            cursor.close()
 
         except Exception as e:
-            error_msg = f"Lỗi trong quá trình Extract: {e}"
-            print(f"🚨 {error_msg}")
-
-            update_config_status(conn, config_id, 'ERROR', 0, flag=1)
-            log_event(conn, config_id, 'ERROR', error_msg)
-
-    conn.close()
-    print("\n--- Hoàn tất quá trình Extract ---")
+            print(f"Finalize error: {e}")
+            conn.rollback()
+        finally:
+            self._close_db_connection()
 
 
-if __name__ == '__main__':
-    run_extract_process()
+def main():
+    parser = argparse.ArgumentParser(description="Run Crawl Job")
+    parser.add_argument('--start', type=str, help='Start Date (YYYY-MM-DD)', default=None)
+    parser.add_argument('--end', type=str, help='End Date (YYYY-MM-DD)', default=None)
+
+    args = parser.parse_args()
+
+    job = CrawlJob(DB_CONFIG, manual_start=args.start, manual_end=args.end)
+
+    if job.setup_config():
+        if job.start_processing():
+            try:
+                job.execute_crawl()
+            finally:
+                job.finalize_job()
+
+
+if __name__ == "__main__":
+    main()
