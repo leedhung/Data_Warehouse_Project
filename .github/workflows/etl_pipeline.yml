@@ -1,0 +1,78 @@
+name: Data Warehouse ETL Pipeline
+
+on:
+  schedule:
+    # Vì git sử dung giờ UTC nên có sự khác biệt
+    # Lịch chạy từ thứ 2 -> thứ 6 hằng tuần vào lúc 5h sáng (GMT+7)
+    - cron: '0 22 * * 0-4'
+  workflow_dispatch:
+
+jobs:
+  run-etl:
+    runs-on: ubuntu-latest
+
+    steps:
+      # B1: Tải code
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # B2: Cài Python
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Create .env file from Secret
+        run: |
+          cd scripts
+          echo "${{ secrets.ENV }}" > .env
+          echo "File .env created successfully!"
+
+      # B3: Cài thư viện
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          
+          # Di chuyển vào thư mục scripts (nơi chứa file requirements.txt)
+          cd scripts
+          
+          # Cài đặt tất cả thư viện trong list
+          pip install -r requirements.txt
+
+      # B4: Chạy Crawl
+      - name: 1. Run Crawl Data
+        run: |
+          cd scripts
+          python crawl_data.py
+
+      # B5: Chạy Load Staging
+      - name: 2. Load to Staging
+        run: |
+          cd scripts
+          python load_staging.py
+
+      # B6: Chạy Transform
+      - name: 3. Transform Data
+        run: |
+          cd scripts
+          python transform_job.py
+
+      # B7: Chạy Load Real DWH
+      - name: 4. Load to Real DWH
+        run: |
+          cd scripts
+          python load_dw.py
+
+      # B8: Chạy Aggregate
+      - name: 5. Aggregate Data Mart
+        run: |
+          cd scripts
+          python aggregate.py
+
+      # B9: Lưu Artifact (Tùy chọn)
+      - name: Upload CSV Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-crawled-data
+          path: scripts/csv_output/
