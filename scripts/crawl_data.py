@@ -7,9 +7,9 @@ import argparse
 from dotenv import load_dotenv
 from vnstock import Finance, Vnstock, Listing, Quote
 
+# --- [Step 2] Load toàn bộ variable environment ---
 load_dotenv()
 
-# --- Cấu hình Database ---
 DB_CONFIG = {
     "host": os.getenv("DB_HOST_CONTROLLER", "localhost"),
     "port": os.getenv("DB_PORT_CONTROLLER", "3306"),
@@ -18,18 +18,8 @@ DB_CONFIG = {
     "database": os.getenv("DB_NAME_CONTROLLER")
 }
 
-# --- Cấu hình Đường dẫn (Sử dụng r"" để tránh lỗi đường dẫn Windows) ---
-# Lưu ý: Nếu không tìm thấy trong .env, nó sẽ dùng đường dẫn mặc định này
-DEFAULT_CSV_PATH = os.getenv(
-    "CSV_OUTPUT_PATH",
-    r"D:\Learn\Data Warehouse\DW_project\Data_Warehouse_Project\scripts\csv_output"
-)
-SYMBOL_FILE = os.getenv(
-    "SYMBOL_FILE_PATH",
-    r"D:\Learn\Data Warehouse\DW_project\Data_Warehouse_Project\scripts\symbol_company.txt"
-)
-
-TODAY_DATE = datetime.now().strftime('%Y-%m-%d')
+DEFAULT_CSV_PATH = os.getenv("CSV_OUTPUT_PATH", r"D:\Data_Warehouse\csv_output")
+SYMBOL_FILE = os.getenv("SYMBOL_FILE_PATH", r"D:\Data_Warehouse\symbol_company.txt")
 DATE_FORMAT = '%Y-%m-%d'
 
 
@@ -38,7 +28,6 @@ class CrawlJob:
         self.db_config = db_config
         self.manual_start = manual_start
         self.manual_end = manual_end
-
         self.conn = None
         self.config_id = None
         self.job_config = None
@@ -47,13 +36,11 @@ class CrawlJob:
         self.crawled_data_ratio = []
         self.data_listing_exchange = None
         self.data_listing_industries = None
-        self.error_count = 0
-        self.success_count = 0
 
     def _get_db_connection(self):
+        # --- [Step 3] Kết nối tới DB ---
         try:
-            if any(v is None for v in self.db_config.values()):
-                return None
+            if any(v is None for v in self.db_config.values()): return None
             if not self.conn or not self.conn.is_connected():
                 self.conn = mysql.connector.connect(**self.db_config)
             return self.conn
@@ -63,59 +50,41 @@ class CrawlJob:
     def _close_db_connection(self):
         if self.conn and self.conn.is_connected():
             self.conn.close()
-            self.conn = None
 
     def _insert_logging(self, status: str, description: str):
-        if not self.config_id:
-            print(f"[LOGGING FAILED] Status: {status}, Desc: {description}", file=sys.stderr)
-            return
         conn = self._get_db_connection()
-        if not conn: return
+        if not conn or not self.config_id: return
         try:
             cursor = conn.cursor()
-            query = "INSERT INTO logging (id_config, status, description) VALUES (%s, %s, %s)"
-            cursor.execute(query, (self.config_id, status, description))
+            cursor.execute("INSERT INTO logging (id_config, status, description) VALUES (%s, %s, %s)",
+                           (self.config_id, status, description))
             conn.commit()
             cursor.close()
-        except mysql.connector.Error as err:
-            print(f"Error inserting log: {err}")
-            conn.rollback()
+        except mysql.connector.Error:
+            pass
 
     def setup_config(self):
         conn = self._get_db_connection()
         if not conn: return False
-        cursor = conn.cursor(dictionary=True)
 
-        print("\n--- 1. Setting up Config ---")
+        # (Logic chuẩn bị data để test Step 4)
         try:
-            if self.manual_start and self.manual_end:
-                print(f"👉 RUNNING MANUAL MODE: {self.manual_start} to {self.manual_end}")
-                start_dt = datetime.strptime(self.manual_start, DATE_FORMAT)
-                end_dt = datetime.strptime(self.manual_end, DATE_FORMAT)
-            else:
-                print(f"👉 RUNNING DEFAULT MODE: Today ({TODAY_DATE})")
-                start_dt = datetime.strptime(TODAY_DATE, DATE_FORMAT)
-                end_dt = datetime.strptime(TODAY_DATE, DATE_FORMAT)
+            cursor = conn.cursor()
+            start_dt = datetime.strptime(self.manual_start or datetime.now().strftime(DATE_FORMAT), DATE_FORMAT)
+            end_dt = datetime.strptime(self.manual_end or datetime.now().strftime(DATE_FORMAT), DATE_FORMAT)
 
-            # Sửa lỗi cú pháp SQL: Xóa các dấu \ thừa
-            insert_query = """
-                INSERT INTO config (status, flag, is_processing, path, data_date_start, data_date_end)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """
-            cursor.execute(insert_query, ('READY', 1, False, DEFAULT_CSV_PATH, start_dt, end_dt))
+            cursor.execute("""
+                           INSERT INTO config (status, flag, is_processing, path, data_date_start, data_date_end)
+                           VALUES (%s, %s, %s, %s, %s, %s)
+                           """, ('READY', 1, False, DEFAULT_CSV_PATH, start_dt, end_dt))
+
             self.config_id = cursor.lastrowid
             conn.commit()
-            print(f"Job Setup Complete. Config ID: {self.config_id}")
-            return True
-        except mysql.connector.Error as err:
-            print(f"Config setup error: {err}")
-            conn.rollback()
-            return False
-        except ValueError as ve:
-            print(f"Date format error (Use YYYY-MM-DD): {ve}")
-            return False
-        finally:
             cursor.close()
+            return True
+        except Exception as e:
+            print(f"Setup Error: {e}")
+            return False
 
     def start_processing(self):
         if not self.config_id: return False
@@ -126,13 +95,15 @@ class CrawlJob:
             cursor = conn.cursor(dictionary=True)
             conn.start_transaction()
 
-            # Sửa lỗi cú pháp SQL: Xóa các dấu \ thừa
-            update_query = """
-                UPDATE config
-                SET status = 'CRAWLING', is_processing = TRUE
-                WHERE id = %s AND status = 'READY' AND is_processing = FALSE
-            """
-            cursor.execute(update_query, (self.config_id,))
+            # --- [Step 4, 5, 6] Check Flag=1/Ready -> Set Status=CRAWLING & is_processing=1 ---
+            cursor.execute("""
+                           UPDATE config
+                           SET status        = 'CRAWLING',
+                               is_processing = TRUE
+                           WHERE id = %s
+                             AND status = 'READY'
+                             AND is_processing = FALSE
+                           """, (self.config_id,))
 
             if cursor.rowcount == 0:
                 conn.rollback()
@@ -141,134 +112,124 @@ class CrawlJob:
             conn.commit()
             cursor.execute("SELECT * FROM config WHERE id = %s", (self.config_id,))
             self.job_config = cursor.fetchone()
+            cursor.close()
             return True
-
         except mysql.connector.Error:
             conn.rollback()
             return False
-        finally:
-            if 'cursor' in locals() and cursor: cursor.close()
 
     def execute_crawl(self):
         if not self.job_config: return
-        self._insert_logging('CRAWLING', 'Start crawling 5 data types.')
 
-        start_date_str = self.job_config['data_date_start'].strftime(DATE_FORMAT)
-        end_date_str = self.job_config['data_date_end'].strftime(DATE_FORMAT)
+        # --- [Step 7] Lấy danh sách ngày cần crawl từ config ---
+        start_date = self.job_config['data_date_start'].strftime(DATE_FORMAT)
+        end_date = self.job_config['data_date_end'].strftime(DATE_FORMAT)
 
+        # --- [Step 8] Lấy danh sách công ty từ file ---
         try:
-            # Sử dụng đường dẫn file symbol từ cấu hình
             with open(SYMBOL_FILE, 'r', encoding='utf-8') as f:
                 symbols = [line.strip() for line in f if line.strip()]
         except FileNotFoundError:
             symbols = []
-            self._insert_logging('ERR', f"File {SYMBOL_FILE} not found.")
 
+        # (Pre-crawl listing data)
         try:
             listing = Listing()
             self.data_listing_exchange = listing.symbols_by_exchange()
             self.data_listing_industries = listing.symbols_by_industries()
-            self.success_count += 2
-        except Exception as e:
-            self._insert_logging('WARN', f"Listing data error (skipped): {e}")
+        except:
+            pass
 
+        # --- [Loop] Crawl cho từng công ty ---
         for symbol in symbols:
             try:
+                # --- [Step 9] Load thông tin công ty ---
                 company_api = Vnstock().stock(symbol=symbol, source='TCBS').company
-                finance_api = Finance(symbol=symbol, source='VCI')
-                quote_api = Quote(symbol=symbol, source='VCI')
-
                 df_overview = company_api.overview()
                 df_overview['symbol'] = symbol
                 self.crawled_data_overview.append(df_overview)
 
+                # --- [Step 10] Load chỉ số tài chính ---
+                finance_api = Finance(symbol=symbol, source='VCI')
                 df_ratio = finance_api.ratio(period='year', lang='vi', dropna=True)
                 df_ratio['symbol'] = symbol
                 self.crawled_data_ratio.append(df_ratio)
 
-                df_history = quote_api.history(start=start_date_str, end=end_date_str, interval='1D')
+                # --- [Step 11] Load chỉ số cổ phiếu ---
+                quote_api = Quote(symbol=symbol, source='VCI')
+                df_history = quote_api.history(start=start_date, end=end_date, interval='1D')
                 df_history['symbol'] = symbol
                 self.crawled_data_price.append(df_history)
 
-                self.success_count += 3
             except Exception as e:
-                self.error_count += 1
-                self._insert_logging('ERR', f"Error for {symbol}: {e}")
+                # --- [Step 12] Set status=ERR & processing=0 (xử lý nội bộ) ---
+                # --- [Step 13] Ghi Log ERR ---
+                self._insert_logging('ERR', f"Crawl error {symbol}: {e}")
 
     def finalize_job(self):
         if not self.config_id: return
         conn = self._get_db_connection()
         if not conn: return
+        cursor = conn.cursor()
 
-        final_status = 'ERR'
-        final_flag = 0
+        # --- [Step 14] Lấy path lưu file ---
+        path = self.job_config['path'] if self.job_config else DEFAULT_CSV_PATH
+        os.makedirs(path, exist_ok=True)
+        date_tag = self.job_config['data_date_end'].strftime(DATE_FORMAT)
+
+        saved_rows = 0
+
+        # --- [Step 15] Chuyển data thành file CSV ---
+        def save(data, prefix, is_df=False):
+            nonlocal saved_rows
+            if not is_df and not data: return
+            df = data if is_df else pd.concat(data, ignore_index=True)
+            df.to_csv(os.path.join(path, f"{prefix}_{date_tag}.csv"), index=False)
+            saved_rows += len(df)
 
         try:
-            cursor = conn.cursor()
-            # Sử dụng path từ DB config hoặc fallback về DEFAULT
-            path = self.job_config['path'] if self.job_config else DEFAULT_CSV_PATH
-            os.makedirs(path, exist_ok=True)
+            save(self.crawled_data_price, "price_history")
+            save(self.crawled_data_overview, "company_overview")
+            save(self.crawled_data_ratio, "finance_ratio")
+            save(self.data_listing_exchange, "listing_exchange", is_df=True)
 
-            date_tag = self.job_config['data_date_end'].strftime(DATE_FORMAT)
-            total_rows_saved = 0
-
-            def save_to_csv(data, name_prefix, is_df=False):
-                nonlocal total_rows_saved
-                if is_df and data is not None:
-                    df = data
-                elif data and isinstance(data, list):
-                    df = pd.concat(data, ignore_index=True)
-                else:
-                    return 0
-
-                filename = f"{name_prefix}_{date_tag}.csv"
-                full_path = os.path.join(path, filename)
-                df.to_csv(full_path, index=False)
-                print(f"Saved {name_prefix}: {len(df)} rows")
-                total_rows_saved += len(df)
-                return len(df)
-
-            save_to_csv(self.crawled_data_price, "price_history")
-            save_to_csv(self.crawled_data_overview, "company_overview")
-            save_to_csv(self.crawled_data_ratio, "finance_ratio")
-            save_to_csv(self.data_listing_exchange, "listing_exchange", is_df=True)
-            save_to_csv(self.data_listing_industries, "listing_industries", is_df=True)
-
-            if total_rows_saved > 0:
-                final_status = 'CRAWLED'
-                final_flag = 1
-                self._insert_logging('SUCCESS', f"Finished. Saved {total_rows_saved} rows.")
+            # --- [Step 16] Check lưu thành công? ---
+            if saved_rows > 0:
+                # --- [Step 16.2.1 & 16.2.2] Success -> Update Status CRAWLED & Log ---
+                status, flag, log_msg = 'CRAWLED', 1, f"Success: {saved_rows} rows"
+                self._insert_logging('SUCCESS', log_msg)
             else:
-                self._insert_logging('FAIL', "No data saved.")
+                # --- [Step 16.1.1 & 16.1.2] Fail -> Update Status ERR & Log ---
+                status, flag, log_msg = 'ERR', 0, "Failed: No data saved"
+                self._insert_logging('FAIL', log_msg)
 
-            update_query = "UPDATE config SET status = %s, is_processing = FALSE, flag = %s WHERE id = %s"
-            cursor.execute(update_query, (final_status, final_flag, self.config_id))
+            cursor.execute("""
+                           UPDATE config
+                           SET status        = %s,
+                               is_processing = FALSE,
+                               flag          = %s
+                           WHERE id = %s
+                           """, (status, flag, self.config_id))
             conn.commit()
-            print(f"Job Finalized. Status: {final_status}")
-            cursor.close()
 
         except Exception as e:
-            print(f"Finalize error: {e}")
-            conn.rollback()
+            self._insert_logging('FAIL', f"System Error: {e}")
         finally:
             self._close_db_connection()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run Crawl Job")
-    parser.add_argument('--start', type=str, help='Start Date (YYYY-MM-DD)', default=None)
-    parser.add_argument('--end', type=str, help='End Date (YYYY-MM-DD)', default=None)
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--start', type=str)
+    parser.add_argument('--end', type=str)
     args = parser.parse_args()
 
-    job = CrawlJob(DB_CONFIG, manual_start=args.start, manual_end=args.end)
+    job = CrawlJob(DB_CONFIG, args.start, args.end)
 
-    if job.setup_config():
-        if job.start_processing():
-            try:
-                job.execute_crawl()
-            finally:
-                job.finalize_job()
+    if job.setup_config():  # Init
+        if job.start_processing():  # Step 2-6
+            job.execute_crawl()  # Step 7-13
+            job.finalize_job()  # Step 14-16
 
 
 if __name__ == "__main__":
