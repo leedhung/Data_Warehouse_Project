@@ -1,10 +1,13 @@
 name: Data Warehouse ETL Pipeline
 
 on:
+  push:
+    branches: [ "main" ]
+
+  # 2. Chạy theo lịch (5h chiều  VN)
   schedule:
-    # Vì git sử dung giờ UTC nên có sự khác biệt
-    # Lịch chạy từ thứ 2 -> thứ 6 hằng tuần vào lúc 5h sáng (GMT+7)
-    - cron: '0 22 * * 0-4'
+    - cron: '0 10 * * 1-5'
+
   workflow_dispatch:
 
 jobs:
