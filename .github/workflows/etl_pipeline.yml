@@ -28,14 +28,25 @@ jobs:
           echo "${{ secrets.ENV }}" > .env
           echo "File .env created successfully!"
 
-      # B3: Cài thư viện
+      - name: Debug - List all files
+        run: |
+          echo "📂 Cấu trúc thư mục hiện tại:"
+          ls -R
+      
+
+      - name: Create .env file
+        run: |
+          cd scripts
+          echo "${{ secrets.ENV }}" > .env
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           
-          cd scripts
+          echo "📂 Kiểm tra folder scripts:"
+          ls -l scripts/
           
-          # Cài đặt tất cả thư viện trong list
+          cd scripts
           pip install -r requirements.txt
 
       # B4: Chạy Crawl
