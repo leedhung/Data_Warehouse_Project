@@ -68,7 +68,7 @@ jobs:
       - name: 3. Transform Data
         run: |
           cd scripts
-          python transform_job.py
+          python transform_data.py
 
       # B7: Chạy Load Real DWH
       - name: 4. Load to Real DWH
