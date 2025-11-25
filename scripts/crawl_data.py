@@ -7,6 +7,7 @@ import argparse
 from dotenv import load_dotenv
 from vnstock import Finance, Vnstock, Listing, Quote
 
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv()
 # Bước 2: Load toàn bộ các biến cấu hình kết nối tới db config
 DB_CONFIG = {
@@ -19,13 +20,13 @@ DB_CONFIG = {
 
 # Bước 14: lấy path để lưu trữ các file csv
 DEFAULT_CSV_PATH = os.getenv(
-    "CSV_OUTPUT_PATH",
-    r"D:\Learn\Data Warehouse\DW_project\Data_Warehouse_Project\scripts\csv_output"
+    CURRENT_DIR,
+    "csv_output"
 )
 # Bước 8: lấy toàn bộ danh sách các công ty cần theo dõi
 SYMBOL_FILE = os.getenv(
-    "SYMBOL_FILE_PATH",
-    r"D:\Learn\Data Warehouse\DW_project\Data_Warehouse_Project\scripts\symbol_company.txt"
+    CURRENT_DIR,
+    "symbol_company.txt"
 )
 # Bước 7:  lấy các ngày cần crawl dữ liệu
 TODAY_DATE = datetime.now().strftime('%Y-%m-%d')
